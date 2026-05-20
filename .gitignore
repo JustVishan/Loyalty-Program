@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+app/backend/node_modules/
+app/frontend/node_modules/
+
+# Environment files — never commit these
+.env
+app/backend/.env
+app/frontend/.env
+
+# Build output
+dist/
+app/backend/dist/
+app/frontend/dist/
+
+# Drizzle migrations (generated)
+app/backend/drizzle/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
