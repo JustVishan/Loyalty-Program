@@ -34,6 +34,10 @@ app.setErrorHandler((err: any, _req, reply) => {
     const first = err.issues[0]
     return reply.status(400).send({ error: first ? `${first.path.join('.')}: ${first.message}` : 'Validation error' })
   }
+  // FK violation on users table means the JWT references a deleted user
+  if (err?.cause?.message?.includes('users_user_id_fk')) {
+    return reply.status(401).send({ error: 'Session invalid — please log in again' })
+  }
   app.log.error(err)
   reply.status(err.statusCode ?? 500).send({ error: err.message ?? 'Internal server error' })
 })
