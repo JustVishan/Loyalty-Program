@@ -4,6 +4,7 @@ import fjwt from '@fastify/jwt'
 import fcookie from '@fastify/cookie'
 import fcors from '@fastify/cors'
 import fhelmet from '@fastify/helmet'
+import rateLimit from '@fastify/rate-limit'
 import { ZodError } from 'zod/v4'
 import { authRoutes } from './routes/auth.js'
 import { memberRoutes } from './routes/members.js'
@@ -20,6 +21,7 @@ const app = Fastify({ logger: true })
 // ---------------------------------------------------------------------------
 
 await app.register(fhelmet)
+await app.register(rateLimit, { global: false })
 const corsOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:5173').split(',').map(o => o.trim())
 await app.register(fcors, {
   origin:      corsOrigins.length === 1 ? corsOrigins[0] : corsOrigins,
@@ -42,10 +44,15 @@ app.setErrorHandler((err: any, _req, reply) => {
   reply.status(err.statusCode ?? 500).send({ error: err.message ?? 'Internal server error' })
 })
 
-// Decorate authenticate — used as onRequest hook on protected routes
+// Decorate authenticate — reads JWT from httpOnly cookie, falls back to Authorization header
 app.decorate('authenticate', async (req: any, reply: any) => {
   try {
-    await req.jwtVerify()
+    const cookieToken = req.cookies?.accessToken
+    if (cookieToken) {
+      req.user = app.jwt.verify(cookieToken)
+    } else {
+      await req.jwtVerify()
+    }
   } catch {
     reply.status(401).send({ error: 'Unauthorized' })
   }

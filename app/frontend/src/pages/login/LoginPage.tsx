@@ -22,7 +22,6 @@ export function LoginPage() {
         setPreAuth(data.preAuthToken)
         setStep('2fa')
       } else {
-        localStorage.setItem('accessToken', data.accessToken)
         localStorage.setItem('user', JSON.stringify(data.user))
         navigate('/')
       }
@@ -39,7 +38,6 @@ export function LoginPage() {
     setLoading(true)
     try {
       const { data } = await api.post('/auth/verify-2fa', { preAuthToken, totpCode })
-      localStorage.setItem('accessToken', data.accessToken)
       localStorage.setItem('user', JSON.stringify(data.user))
       navigate('/')
     } catch (err: any) {

@@ -7,11 +7,28 @@ import { hashPassword, verifyPassword, generateTotpSecret, verifyTotp, generateT
 import { writeAudit } from '../lib/audit.js'
 
 const MAX_FAILED_ATTEMPTS = 5
+const MAX_2FA_ATTEMPTS    = 5
+
+// Dummy hash — ensures bcrypt always runs (~100ms) even when username doesn't exist,
+// preventing timing-based username enumeration.
+const DUMMY_HASH = '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtGMnNIzB/2ixcFFlAuTRr.xgfJu'
+
+// TOTP replay cache — prevents reuse of a code within the 90-second TOTP window.
+const usedTotpCodes = new Map<string, number>()
+function markTotpUsed(userId: string, code: string) {
+  usedTotpCodes.set(`${userId}:${code}`, Date.now())
+  const cutoff = Date.now() - 90_000
+  for (const [k, ts] of usedTotpCodes) if (ts < cutoff) usedTotpCodes.delete(k)
+}
+function isTotpUsed(userId: string, code: string): boolean {
+  const ts = usedTotpCodes.get(`${userId}:${code}`)
+  return ts !== undefined && (Date.now() - ts) < 90_000
+}
 
 export async function authRoutes(app: FastifyInstance) {
 
-  // POST /api/auth/login
-  app.post('/login', async (req, reply) => {
+  // POST /api/auth/login  — 10 attempts per minute per IP
+  app.post('/login', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (req, reply) => {
     const body = z.object({
       username: z.string().min(1),
       password: z.string().min(1),
@@ -21,35 +38,33 @@ export async function authRoutes(app: FastifyInstance) {
 
     const ip = req.ip
 
-    if (!user || !user.active) {
-      await writeAudit({ action: 'login_failed', metadata: { username: body.username, reason: 'user_not_found' }, ipAddress: ip })
+    // Always run bcrypt regardless of whether user exists — prevents timing-based username enumeration
+    const valid = await verifyPassword(body.password, user?.passwordHash ?? DUMMY_HASH)
+
+    if (!user || !user.active || !valid) {
+      if (user && user.active && !valid) {
+        // Valid user, wrong password — track attempt and maybe lock
+        const newAttempts = user.failedLoginAttempts + 1
+        const shouldLock  = newAttempts >= MAX_FAILED_ATTEMPTS
+        await db.update(users)
+          .set({ failedLoginAttempts: newAttempts, lockedAt: shouldLock ? new Date() : null })
+          .where(eq(users.userId, user.userId))
+        await writeAudit({
+          userId: user.userId, userRole: user.role,
+          action: 'login_failed',
+          metadata: { reason: 'wrong_password', attempts: newAttempts, locked: shouldLock },
+          ipAddress: ip,
+        })
+        if (shouldLock) return reply.status(403).send({ error: 'Account locked after too many failed attempts.' })
+      } else {
+        await writeAudit({ action: 'login_failed', metadata: { username: body.username, reason: 'user_not_found' }, ipAddress: ip })
+      }
       return reply.status(401).send({ error: 'Invalid credentials' })
     }
 
     if (user.lockedAt) {
       await writeAudit({ action: 'login_failed', userId: user.userId, userRole: user.role, metadata: { reason: 'account_locked' }, ipAddress: ip })
       return reply.status(403).send({ error: 'Account locked. Contact your administrator.' })
-    }
-
-    const valid = await verifyPassword(body.password, user.passwordHash)
-
-    if (!valid) {
-      const newAttempts = user.failedLoginAttempts + 1
-      const shouldLock  = newAttempts >= MAX_FAILED_ATTEMPTS
-
-      await db.update(users)
-        .set({ failedLoginAttempts: newAttempts, lockedAt: shouldLock ? new Date() : null })
-        .where(eq(users.userId, user.userId))
-
-      await writeAudit({
-        userId: user.userId, userRole: user.role,
-        action: 'login_failed',
-        metadata: { reason: 'wrong_password', attempts: newAttempts, locked: shouldLock },
-        ipAddress: ip,
-      })
-
-      if (shouldLock) return reply.status(403).send({ error: 'Account locked after too many failed attempts.' })
-      return reply.status(401).send({ error: 'Invalid credentials' })
     }
 
     // Password correct — check 2FA requirement
@@ -68,8 +83,8 @@ export async function authRoutes(app: FastifyInstance) {
     return issueSession(app, reply, user, ip)
   })
 
-  // POST /api/auth/verify-2fa
-  app.post('/verify-2fa', async (req, reply) => {
+  // POST /api/auth/verify-2fa  — 10 attempts per 5 minutes per IP
+  app.post('/verify-2fa', { config: { rateLimit: { max: 10, timeWindow: '5 minutes' } } }, async (req, reply) => {
     const body = z.object({
       preAuthToken: z.string(),
       totpCode:     z.string().length(6),
@@ -89,12 +104,26 @@ export async function authRoutes(app: FastifyInstance) {
     const [user] = await db.select().from(users).where(eq(users.userId, payload.sub)).limit(1)
     if (!user || !user.totpSecret) return reply.status(401).send({ error: 'Invalid session' })
 
+    if (user.lockedAt) return reply.status(403).send({ error: 'Account locked. Contact your administrator.' })
+
+    // Replay check — reject code that was already used within its 90-second window
+    if (isTotpUsed(user.userId, body.totpCode)) {
+      return reply.status(401).send({ error: 'Code already used — wait for the next code' })
+    }
+
     const valid = verifyTotp(body.totpCode, user.totpSecret)
     if (!valid) {
-      await writeAudit({ userId: user.userId, userRole: user.role, action: '2fa_failed', ipAddress: req.ip })
+      const newAttempts = user.failedLoginAttempts + 1
+      const shouldLock  = newAttempts >= MAX_2FA_ATTEMPTS
+      await db.update(users)
+        .set({ failedLoginAttempts: newAttempts, lockedAt: shouldLock ? new Date() : null })
+        .where(eq(users.userId, user.userId))
+      await writeAudit({ userId: user.userId, userRole: user.role, action: '2fa_failed', metadata: { attempts: newAttempts, locked: shouldLock }, ipAddress: req.ip })
+      if (shouldLock) return reply.status(403).send({ error: 'Account locked after too many failed 2FA attempts.' })
       return reply.status(401).send({ error: 'Invalid 2FA code' })
     }
 
+    markTotpUsed(user.userId, body.totpCode)
     await writeAudit({ userId: user.userId, userRole: user.role, action: '2fa_verified', ipAddress: req.ip })
     return issueSession(app, reply, user, req.ip)
   })
@@ -139,7 +168,7 @@ export async function authRoutes(app: FastifyInstance) {
   app.post('/logout', { onRequest: [app.authenticate] }, async (req, reply) => {
     const user = (req as any).user
     await writeAudit({ userId: user.sub, userRole: user.role, action: 'logout', ipAddress: req.ip })
-    reply.clearCookie('refreshToken')
+    reply.clearCookie('accessToken', { path: '/' })
     return reply.send({ success: true })
   })
 
@@ -172,11 +201,20 @@ const SESSION_EXPIRY: Record<string, string> = {
 // Helper — issue access token + set refresh cookie
 // ---------------------------------------------------------------------------
 async function issueSession(app: FastifyInstance, reply: any, user: any, ip: string) {
-  const expiresIn  = SESSION_EXPIRY[user.role as string] ?? '8h'
+  const expiresIn   = SESSION_EXPIRY[user.role as string] ?? '8h'
   const accessToken = await reply.jwtSign(
     { sub: user.userId, role: user.role, branchId: user.branchId },
     { expiresIn },
   )
+
+  const isProduction = process.env.NODE_ENV === 'production'
+  reply.setCookie('accessToken', accessToken, {
+    httpOnly: true,
+    secure:   isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
+    path:     '/',
+    maxAge:   8 * 60 * 60, // 8 hours in seconds
+  })
 
   await db.update(users)
     .set({ failedLoginAttempts: 0, lockedAt: null, lastLoginAt: new Date() })
@@ -184,7 +222,7 @@ async function issueSession(app: FastifyInstance, reply: any, user: any, ip: str
 
   await writeAudit({ userId: user.userId, userRole: user.role, action: 'login_success', ipAddress: ip })
 
-  return reply.send({ accessToken, user: {
+  return reply.send({ user: {
     userId:   user.userId,
     username: user.username,
     role:     user.role,

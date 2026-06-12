@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { api } from '../lib/api.js'
 import type { AuthUser } from '../types/index.js'
 
 export function useAuth() {
@@ -11,8 +12,8 @@ export function useAuth() {
   const isBranchAdmin  = user?.role === 'branch_admin'
   const isAdminOrAbove = isSuperAdmin || isBranchAdmin
 
-  function logout() {
-    localStorage.removeItem('accessToken')
+  async function logout() {
+    try { await api.post('/auth/logout') } catch { /* ignore */ }
     localStorage.removeItem('user')
     window.location.href = '/login'
   }
